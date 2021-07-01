@@ -244,68 +244,60 @@ Function Get-AzDomainInfo
             Foreach ($storageAccount in $storageAccountLists){
                 $StorageAccountName = $storageAccount.StorageAccountName
         
-                Write-Verbose "`tListing out blob files for the $StorageAccountName storage account..."
+                Write-Verbose "`tListing out public blob files for the $StorageAccountName storage account..."
                 
-                # Try to Set Context, Write-Verbose if you don't have the rights
-                Try{
+                # Try to get list of containers, check access level for containers
                     
-                    Set-AzCurrentStorageAccount –ResourceGroupName $storageAccount.ResourceGroupName -Name $storageAccount.StorageAccountName -ErrorAction Stop | Out-Null
+                $ContainerList = Get-AzRmStorageContainer -StorageAccountName $storageAccount.StorageAccountName -ResourceGroupName $storageAccount.ResourceGroupName | select Name, PublicAccess 
+
+                if ($ContainerList -ne $null){
+                    $ContainerListFile = (-join ($StorageAccountName,'-Containers.csv'))
+                    Write-Verbose "`t`tWriting available containers to $ContainerListFile"
+                    $ContainerList | Export-Csv -LiteralPath $folder"\Files\"$ContainerListFile -NoTypeInformation 
                     
-                                        
-                    $strgName = $storageAccount.StorageAccountName
+                    $ContainerList | ForEach-Object {
+                        if ($_.PublicAccess -eq "Container") {
+                            Write-Verbose (-join ("`t`tFound Public Container - ",$_.Name))
 
-                    # Create folder for each Storage Account for cleaner output
-                    if(Test-Path $folder"\Files\"$strgName){}
-                    else{New-Item -ItemType Directory $folder"\Files\"$strgName | Out-Null}
+                            # URL for listing publicly available files
+                            $uriList = "https://"+(-join ($StorageAccountName,'.blob.core.windows.net/',$_.Name))+"/?restype=container&comp=list"
+                            $FileList = (Invoke-WebRequest -uri $uriList -Method Get -Verbose:$False).Content
+                                
+                            # Microsoft includes these characters in the response, Thanks...
+                            [xml]$xmlFileList = $FileList -replace 'ï»¿'
+                            $foundURL = ""
+                            $foundURL = $xmlFileList.EnumerationResults.Blobs.Blob.Name
 
-                    # List Containers and Files and Export to CSV
-                    $containers = Get-AzStorageContainer | select Name
-        
-                    foreach ($container in $containers){
-                        $containerName = $container.Name
-                        Write-Verbose "`t`tListing files for the $containerName container"
-                        $pathName = "\Files\"+$strgName+"\Blob_Files_"+$container.Name
-                        $blobs = Get-AzStorageBlob -Container $container.Name 
-                        $blobs | ForEach-Object {$_.ICloudBlob | select @{name="Uri"; expression={$_.Uri}},@{name="StorageUri"; expression={$_.StorageUri}},@{name="SnapshotTime"; expression={$_.SnapshotTime}},@{name="IsSnapshot"; expression={$_.IsSnapshot}},@{name="IsDeleted"; expression={$_.IsDeleted}},@{name="SnapshotQualifiedUri"; expression={$_.SnapshotQualifiedUri}},@{name="SnapshotQualifiedStorageUri"; expression={$_.SnapshotQualifiedStorageUri}},@{name="Name"; expression={$_.Name}},@{name="BlobType"; expression={$_.BlobType}}} | Export-Csv -NoTypeInformation -LiteralPath $folder$pathName".CSV"
-            
-                        # Check if the container is public, write to PublicFileURLs.txt
-                        $publicStatus = Get-AzStorageContainerAcl $container.Name | select PublicAccess
-                        if (($publicStatus.PublicAccess -eq "Blob")){
-
-                            #Write public file URL to list
-                            $blobName = Get-AzStorageBlob -Container $container.Name | select Name
-                        
-                            $pubfileName = $blobName.Name 
-                            
-                            if ($pubfileName -eq $null){$pubfileName = "Empty_Container_Folder"}
-                            Write-Verbose "`t`t`tPublic File Found - $pubfileName"
-
-                            $blobName.Name | ForEach-Object{ 
-                                $blobUrl = (-join ("https://$StorageAccountName.blob.core.windows.net/$containerName/",$_))
-                                # Write out available files within "Blob" containers
-                                $blobUrl >> $folder"\Files\BlobFileURLs.txt"
-                                }
+                            # Parse the XML results
+                            if($foundURL.Length -gt 1){
+                                foreach($url in $foundURL){Write-Verbose "`t`t`tPublic File Available: $url"; -join("https://",$StorageAccountName,'.blob.core.windows.net/',$_.Name,"/",$url) | Out-File -LiteralPath $folder"\Files\Container_Files.txt" -Append}
                             }
+                            else{Write-Verbose "`t`tEmpty Public Container Available: $uriList";$uriList | Out-File -LiteralPath $folder"\Files\Empty_Containers.txt" -Append}
+                        }
+                        if ($_.PublicAccess -eq "Blob") {
+                            Write-Verbose (-join ("`t`tFound Blob Permissioned Container - ",$_.Name))
+                            "https://"+(-join ($StorageAccountName,'.blob.core.windows.net/',$_.Name)) | Out-File -LiteralPath $folder"\Files\Blob_Containers.txt" -Append
 
-                        if ($publicStatus.PublicAccess -eq "Container"){
-                            Write-Verbose "`t`t`t$containerName Container is Public" 
-                            #Write public container URL to list
-                            $blobName = Get-AzStorageBlob -Container $container.Name | select Name
-                            $blobUrl = "https://$StorageAccountName.blob.core.windows.net/$containerName/"
-                            $blobUrl >> $folder"\Files\PublicContainers.txt"
-                            # Write out available files within "Container" containers
-                            foreach ($blobfile in $blobName){                                
-                                $blobUrl = "https://$StorageAccountName.blob.core.windows.net/$containerName/"+$blobfile.Name
-                                $blobUrl >> $folder"\Files\ContainersFileUrls.txt"
-                                }
-                            
-                            }
+                        }
                     }
+                }
+
+                else{Write-Verbose "`t`tNo containers to list in the storage account"}
+
+                # Attempt to list File Shares and Tables - typically requires contributor permissions
+                Try{
+                    Set-AzCurrentStorageAccount –ResourceGroupName $storageAccount.ResourceGroupName -Name $storageAccount.StorageAccountName -ErrorAction Stop | Out-Null
+                    $strgName = $storageAccount.StorageAccountName
 
                     #Go through each File Service endpoint
                     Try{
                         $AZFileShares = Get-AzStorageShare -ErrorAction Stop | select Name
                         if($AZFileShares.Length -gt 0){
+
+                            # Create folder for each Storage Account for cleaner output
+                            if(Test-Path $folder"\Files\"$strgName){}
+                            else{New-Item -ItemType Directory $folder"\Files\"$strgName | Out-Null}
+
                             Write-Verbose "`tListing out File Service files for the $StorageAccountName storage account..."
                             foreach ($share in $AZFileShares) {
                                 $shareName = $share.Name
@@ -326,6 +318,11 @@ Function Get-AzDomainInfo
                     Try{            
                         $tableList = Get-AzStorageTable -ErrorAction Stop 
                         if ($tableList.Length -gt 0){
+
+                            # Create folder for each Storage Account for cleaner output
+                            if(Test-Path $folder"\Files\"$strgName){}
+                            else{New-Item -ItemType Directory $folder"\Files\"$strgName | Out-Null}                            
+                            
                             $tableList | Export-Csv -NoTypeInformation -LiteralPath $folder"\Files\"$strgName"\Data_Tables.CSV"
                             Write-Verbose "`tListing out Data Tables for the $StorageAccountName storage account..."
                             }
@@ -438,8 +435,39 @@ Function Get-AzDomainInfo
         Get-AzResourceGroup | Get-AzResourceGroupDeployment |  Out-File -LiteralPath $folder"\Resources\Deployments.txt"
 
         # Get Key Vault Policies
-        Write-Verbose "`tGetting Key Vault Policies..."
+        Write-Verbose "Getting Key Vault Policies..."
         Get-AzKeyVault | ForEach-Object {$vault = Get-AzKeyVault -VaultName $_.VaultName; $vault.AccessPolicies | Export-Csv -NoTypeInformation -LiteralPath (-join ($folder,'\Resources\',$_.VaultName,'-Vault_Policies.csv'))}
+
+        # Get Automation Accounts
+        Write-Verbose "Getting Automation Account Runbooks and Variables..."
+        $autoAccounts = Get-AzAutomationAccount
+
+        if ($autoAccounts){
+            # Create folder for Automation Accounts
+            if(Test-Path $folder"\Resources\AutomationAccounts"){}
+            else{New-Item -ItemType Directory $folder"\Resources\AutomationAccounts" | Out-Null}
+            
+            # Iterate Automation Accounts
+            $autoAccounts | ForEach-Object {
+            
+                # Create folder for each Automation Account
+                if(Test-Path (-join ($folder,"\Resources\AutomationAccounts\",$_.AutomationAccountName))){}
+                else{New-Item -ItemType Directory (-join ($folder,"\Resources\AutomationAccounts\",$_.AutomationAccountName)) | Out-Null}
+
+                # Get Automation Account Runbook code
+                Get-AzAutomationRunbook -ResourceGroupName $_.ResourceGroupName -AutomationAccountName $_.AutomationAccountName | Export-AzAutomationRunbook -OutputFolder (-join ($folder,'\Resources\AutomationAccounts\',$_.AutomationAccountName,'\')) | Out-Null
+
+                # Get Automation Account Variables
+                $aaVariables = Get-AzAutomationVariable -ResourceGroupName $_.ResourceGroupName -AutomationAccountName $_.AutomationAccountName 
+                if($aaVariables){$aaVariables | Out-File -Append (-join ($folder,'\Resources\AutomationAccounts\',$_.AutomationAccountName,'\Variables.txt')) | Out-Null}
+
+            }
+            $autoCounts = $autoAccounts.count
+            Write-Verbose "`t$autoCounts Automation Accounts were enumerated."
+        }
+
+        
+
     }
 
     if ($VMs -eq "Y"){
@@ -575,41 +603,55 @@ Function Get-AzDomainInfo
         $ownerGroups = $ownersList | where ObjectType -EQ group
         $ownerInherits = foreach ($ownerGroup in $ownerGroups){Get-AzADGroupMember -GroupObjectId $ownerGroup.objectId}
         
+        #Recursively enumerate nested groups for additional owners
+        $ownerNestedGroups = $ownerInherits | where ObjectType -EQ group
+        while($ownerNestedGroups -ne $null){
+            $ownerInherits += foreach ($nestedGroup in $ownerNestedGroups){Get-AzADGroupMember -GroupObjectId $nestedGroup.Id | Where-Object { $_ -NotIn $ownerInherits } }
+            $ownerNestedGroups = foreach ($nestedGroup in $ownerNestedGroups){Get-AzADGroupMember -GroupObjectId $nestedGroup.Id | Where-Object { $_ -NotIn $ownerInherits -and $_.ObjectType -eq 'Group' }}
+        }
+        
         # Write results to file
         if ($ownersList) {
                 $ownersList | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\Owners.csv"
                 # Write-verbose the counts
                 $ownerCounts = ($ownersList| where ObjectType -EQ user).Count
                 Write-Verbose "`t$ownerCounts Users with 'Owner' permissions were enumerated."
-            }
+        }
         if ($ownerInherits){
                 $ownerInherits | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\InheritedOwners.csv"
                 # Write-verbose the counts
                 $ownerCounts = $ownerInherits.Count
-                Write-Verbose "`t$ownerCounts Users with group inherited 'Owner' permissions were enumerated."
-            }
+                Write-Verbose "`t$ownerCounts entities with group-inherited 'Owner' permissions were enumerated."
+        }
         
         # Get the Roles, write them out
         $roles = Get-AzRoleDefinition 
         if($roles){$roles | select Name,Id,IsCustom,Description | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\Roles.csv"; $rolesCount = $roles.Count; Write-Verbose "`t$rolesCount roles were enumerated."}
 
-        # Get the Contributors, write them out
-        $contributors = $roleAssignment | where RoleDefinitionName -EQ Contributor
-        if ($contributors){
-            # Output to file
-            $contributors | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\Contributors.csv"
-
-            # Contributors that are Group Members
-            $contributors | where ObjectType -EQ Group | ForEach-Object{
-                $contributorGroupMembers = Get-AzADGroupMember -GroupObjectId $_.ObjectId
-                $objDisplayname = (Get-AzADGroup -ObjectId $_.ObjectId).DisplayName
-                if ($contributorGroupMembers){
-                        $contributorGroupMembers | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\"$objDisplayname"_InheritedContributors.csv"
-                        $contributorCounts = $contributorGroupMembers.Count
-                        Write-Verbose "`t$contributorCounts Users with 'Contributor' permissions were enumerated."
-                    }
-                }
-
+        # List the Contributors and list out any users in groups
+        $contributorsList = $roleAssignment| where RoleDefinitionName -EQ Contributor
+        $contributorGroups = $contributorsList | where ObjectType -EQ group
+        $contributorInherits = foreach ($contributorGroup in $contributorGroups){Get-AzADGroupMember -GroupObjectId $contributorGroup.objectId}
+        
+        #Recursively enumerate nested groups for additional contributors
+        $contributorNestedGroups = $contributorInherits | where ObjectType -EQ group
+        while($contributorNestedGroups -ne $null){
+            $contributorInherits += foreach ($nestedGroup in $contributorNestedGroups){Get-AzADGroupMember -GroupObjectId $nestedGroup.Id | Where-Object { $_ -NotIn $contributorInherits } }
+            $contributorNestedGroups = foreach ($nestedGroup in $contributorNestedGroups){Get-AzADGroupMember -GroupObjectId $nestedGroup.Id | Where-Object { $_ -NotIn $contributorInherits -and $_.ObjectType -eq 'Group' }}
+        }
+        
+        # Write results to file
+        if ($contributorsList) {
+                $contributorsList | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\Contributors.csv"
+                # Write-verbose the counts
+                $contributorCounts = $contributorsList.Count
+                Write-Verbose "`t$contributorCounts entities with 'Contributor' permissions were enumerated."
+        }
+        if ($contributorInherits){
+                $contributorInherits | Export-Csv -NoTypeInformation -LiteralPath $folder"\RBAC\InheritedContributors.csv"
+                # Write-verbose the counts
+                $contributorCounts = $contributorInherits.Count
+                Write-Verbose "`t$contributorCounts entities with group-inherited 'Contributor' permissions were enumerated."
         }
 
     }
